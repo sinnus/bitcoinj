@@ -40,7 +40,6 @@ import java.util.List;
 public class PostgresFullPrunedBlockStore extends DatabaseFullPrunedBlockStore {
     private static final Logger log = LoggerFactory.getLogger(PostgresFullPrunedBlockStore.class);
 
-    private static final String POSTGRES_DUPLICATE_KEY_ERROR_CODE = "23505";
     private static final String DATABASE_DRIVER_CLASS = "org.postgresql.Driver";
     private static final String DATABASE_CONNECTION_URL_PREFIX = "jdbc:postgresql://";
 
@@ -87,8 +86,6 @@ public class PostgresFullPrunedBlockStore extends DatabaseFullPrunedBlockStore {
     private static final String CREATE_OUTPUTS_HASH_INDEX               = "CREATE INDEX openoutputs_hash_idx ON openoutputs USING btree (hash)";
     private static final String CREATE_UNDOABLE_TABLE_INDEX             = "CREATE INDEX undoableblocks_height_idx ON undoableBlocks USING btree (height)";
 
-    private static final String SELECT_UNDOABLEBLOCKS_EXISTS_SQL        = "select 1 from undoableblocks where hash = ?";
-
     /**
      * Creates a new PostgresFullPrunedBlockStore.
      *
@@ -127,11 +124,6 @@ public class PostgresFullPrunedBlockStore extends DatabaseFullPrunedBlockStore {
     }
 
     @Override
-    protected String getDuplicateKeyErrorCode() {
-        return POSTGRES_DUPLICATE_KEY_ERROR_CODE;
-    }
-
-    @Override
     protected List<String> getCreateTablesSQL() {
         List<String> sqlStatements = new ArrayList<>();
         sqlStatements.add(CREATE_SETTINGS_TABLE);
@@ -165,97 +157,4 @@ public class PostgresFullPrunedBlockStore extends DatabaseFullPrunedBlockStore {
         return DATABASE_DRIVER_CLASS;
     }
 
-    @Override
-    public void put(StoredBlock storedBlock, StoredUndoableBlock undoableBlock) throws BlockStoreException {
-        maybeConnect();
-        // We skip the first 4 bytes because (on mainnet) the minimum target has 4 0-bytes
-        byte[] hashBytes = new byte[28];
-        System.arraycopy(storedBlock.getHeader().getHash().getBytes(), 4, hashBytes, 0, 28);
-        int height = storedBlock.getHeight();
-        byte[] transactions = null;
-        byte[] txOutChanges = null;
-        try {
-            ByteArrayOutputStream bos = new ByteArrayOutputStream();
-            if (undoableBlock.getTxOutChanges() != null) {
-                undoableBlock.getTxOutChanges().serializeToStream(bos);
-                txOutChanges = bos.toByteArray();
-            } else {
-                int numTxn = undoableBlock.getTransactions().size();
-                bos.write(0xFF & numTxn);
-                bos.write(0xFF & (numTxn >> 8));
-                bos.write(0xFF & (numTxn >> 16));
-                bos.write(0xFF & (numTxn >> 24));
-                for (Transaction tx : undoableBlock.getTransactions())
-                    tx.bitcoinSerialize(bos);
-                transactions = bos.toByteArray();
-            }
-            bos.close();
-        } catch (IOException e) {
-            throw new BlockStoreException(e);
-        }
-
-
-        try {
-            if (log.isDebugEnabled())
-                log.debug("Looking for undoable block with hash: " + Utils.HEX.encode(hashBytes));
-
-            PreparedStatement findS = conn.get().prepareStatement(SELECT_UNDOABLEBLOCKS_EXISTS_SQL);
-            findS.setBytes(1, hashBytes);
-
-            ResultSet rs = findS.executeQuery();
-            if (rs.next())
-            {
-                // We already have this output, update it.
-                findS.close();
-
-                // Postgres insert-or-updates are very complex (and finnicky).  This level of transaction isolation
-                // seems to work for bitcoinj
-                PreparedStatement s =
-                        conn.get().prepareStatement(getUpdateUndoableBlocksSQL());
-                s.setBytes(3, hashBytes);
-
-                if (log.isDebugEnabled())
-                    log.debug("Updating undoable block with hash: " + Utils.HEX.encode(hashBytes));
-
-                if (transactions == null) {
-                    s.setBytes(1, txOutChanges);
-                    s.setNull(2, Types.BINARY);
-                } else {
-                    s.setNull(1, Types.BINARY);
-                    s.setBytes(2, transactions);
-                }
-                s.executeUpdate();
-                s.close();
-
-                return;
-            }
-
-            PreparedStatement s =
-                    conn.get().prepareStatement(getInsertUndoableBlocksSQL());
-            s.setBytes(1, hashBytes);
-            s.setInt(2, height);
-
-            if (log.isDebugEnabled())
-                log.debug("Inserting undoable block with hash: " + Utils.HEX.encode(hashBytes)  + " at height " + height);
-
-            if (transactions == null) {
-                s.setBytes(3, txOutChanges);
-                s.setNull(4, Types.BINARY);
-            } else {
-                s.setNull(3, Types.BINARY);
-                s.setBytes(4, transactions);
-            }
-            s.executeUpdate();
-            s.close();
-            try {
-                putUpdateStoredBlock(storedBlock, true);
-            } catch (SQLException e) {
-                throw new BlockStoreException(e);
-            }
-        } catch (SQLException e) {
-            if (!e.getSQLState().equals(POSTGRES_DUPLICATE_KEY_ERROR_CODE))
-                throw new BlockStoreException(e);
-        }
-
-    }
 }

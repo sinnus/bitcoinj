@@ -17,9 +17,10 @@
 
 package org.bitcoinj.store;
 
-import org.bitcoinj.core.*;
+import org.bitcoinj.core.NetworkParameters;
 
-import java.sql.*;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -34,7 +35,6 @@ import java.util.List;
  * decreases the space usage somewhat (to only around 1.3G).
  */
 public class H2FullPrunedBlockStore extends DatabaseFullPrunedBlockStore {
-    private static final String H2_DUPLICATE_KEY_ERROR_CODE = "23505";
     private static final String DATABASE_DRIVER_CLASS = "org.h2.Driver";
     private static final String DATABASE_CONNECTION_URL_PREFIX = "jdbc:h2:";
 
@@ -124,11 +124,6 @@ public class H2FullPrunedBlockStore extends DatabaseFullPrunedBlockStore {
         } catch (SQLException e) {
             throw new BlockStoreException(e);
         }
-    }
-
-    @Override
-    protected String getDuplicateKeyErrorCode() {
-        return H2_DUPLICATE_KEY_ERROR_CODE;
     }
 
     @Override

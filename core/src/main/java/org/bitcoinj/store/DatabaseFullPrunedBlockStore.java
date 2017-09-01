@@ -135,6 +135,10 @@ public abstract class DatabaseFullPrunedBlockStore implements FullPrunedBlockSto
     // Compatibility SQL.
     private static final String SELECT_COMPATIBILITY_COINBASE_SQL               = "SELECT coinbase FROM openoutputs WHERE 1 = 2";
 
+    private static final String SELECT_UNDOABLEBLOCKS_EXISTS_SQL                = "select 1 from undoableblocks where hash = ?";
+    private static final String SELECT_HEADERS_EXISTS_SQL                       = "select 1 from headers where hash = ?";
+    private static final String SELECT_OPENOUTPUTS_EXISTS_SQL                   = "select 1 from openoutputs where hash = ? and index = ?";
+
     protected Sha256Hash chainHeadHash;
     protected StoredBlock chainHeadBlock;
     protected Sha256Hash verifiedChainHeadHash;
@@ -217,13 +221,6 @@ public abstract class DatabaseFullPrunedBlockStore implements FullPrunedBlockSto
      * @return The list of SQL statements.
      */
     protected abstract List<String> getCreateIndexesSQL();
-
-    /**
-     * Get the database specific error code that indicated a duplicate key error when inserting a record.
-     * <p>This is the code returned by {@link java.sql.SQLException#getSQLState()}</p>
-     * @return The database duplicate error code.
-     */
-    protected abstract String getDuplicateKeyErrorCode();
 
     /**
      * Get the SQL to select the total balance for a given address.
@@ -611,31 +608,29 @@ public abstract class DatabaseFullPrunedBlockStore implements FullPrunedBlockSto
     }
 
     protected void putUpdateStoredBlock(StoredBlock storedBlock, boolean wasUndoable) throws SQLException {
-        try {
+        // We skip the first 4 bytes because (on mainnet) the minimum target has 4 0-bytes
+        byte[] hashBytes = new byte[28];
+        System.arraycopy(storedBlock.getHeader().getHash().getBytes(), 4, hashBytes, 0, 28);
+
+        PreparedStatement findS = conn.get().prepareStatement(SELECT_HEADERS_EXISTS_SQL);
+        findS.setBytes(1, hashBytes);
+        ResultSet rs = findS.executeQuery();
+        if (rs.next()) {
+            findS.close();
+            PreparedStatement s = conn.get().prepareStatement(getUpdateHeadersSQL());
+            s.setBoolean(1, true);
+            s.setBytes(2, hashBytes);
+            s.executeUpdate();
+            s.close();
+        } else {
+            findS.close();
             PreparedStatement s =
                     conn.get().prepareStatement(getInsertHeadersSQL());
-            // We skip the first 4 bytes because (on mainnet) the minimum target has 4 0-bytes
-            byte[] hashBytes = new byte[28];
-            System.arraycopy(storedBlock.getHeader().getHash().getBytes(), 4, hashBytes, 0, 28);
             s.setBytes(1, hashBytes);
             s.setBytes(2, storedBlock.getChainWork().toByteArray());
             s.setInt(3, storedBlock.getHeight());
             s.setBytes(4, storedBlock.getHeader().cloneAsHeader().unsafeBitcoinSerialize());
             s.setBoolean(5, wasUndoable);
-            s.executeUpdate();
-            s.close();
-        } catch (SQLException e) {
-            // It is possible we try to add a duplicate StoredBlock if we upgraded
-            // In that case, we just update the entry to mark it wasUndoable
-            if  (!(e.getSQLState().equals(getDuplicateKeyErrorCode())) || !wasUndoable)
-                throw e;
-
-            PreparedStatement s = conn.get().prepareStatement(getUpdateHeadersSQL());
-            s.setBoolean(1, true);
-            // We skip the first 4 bytes because (on mainnet) the minimum target has 4 0-bytes
-            byte[] hashBytes = new byte[28];
-            System.arraycopy(storedBlock.getHeader().getHash().getBytes(), 4, hashBytes, 0, 28);
-            s.setBytes(2, hashBytes);
             s.executeUpdate();
             s.close();
         }
@@ -650,7 +645,6 @@ public abstract class DatabaseFullPrunedBlockStore implements FullPrunedBlockSto
             throw new BlockStoreException(e);
         }
     }
-
 
     @Override
     public void put(StoredBlock storedBlock, StoredUndoableBlock undoableBlock) throws BlockStoreException {
@@ -682,33 +676,25 @@ public abstract class DatabaseFullPrunedBlockStore implements FullPrunedBlockSto
         }
 
         try {
-            try {
-                PreparedStatement s =
-                        conn.get().prepareStatement(getInsertUndoableBlocksSQL());
-                s.setBytes(1, hashBytes);
-                s.setInt(2, height);
-                if (transactions == null) {
-                    s.setBytes(3, txOutChanges);
-                    s.setNull(4, Types.BINARY);
-                } else {
-                    s.setNull(3, Types.BINARY);
-                    s.setBytes(4, transactions);
-                }
-                s.executeUpdate();
-                s.close();
-                try {
-                    putUpdateStoredBlock(storedBlock, true);
-                } catch (SQLException e) {
-                    throw new BlockStoreException(e);
-                }
-            } catch (SQLException e) {
-                if (!e.getSQLState().equals(getDuplicateKeyErrorCode()))
-                    throw new BlockStoreException(e);
+            if (log.isDebugEnabled())
+                log.debug("Looking for undoable block with hash: " + Utils.HEX.encode(hashBytes));
 
-                // There is probably an update-or-insert statement, but it wasn't obvious from the docs
+            PreparedStatement findS = conn.get().prepareStatement(SELECT_UNDOABLEBLOCKS_EXISTS_SQL);
+            findS.setBytes(1, hashBytes);
+
+            ResultSet rs = findS.executeQuery();
+            if (rs.next())
+            {
+                // We already have this output, update it.
+                findS.close();
+
                 PreparedStatement s =
                         conn.get().prepareStatement(getUpdateUndoableBlocksSQL());
                 s.setBytes(3, hashBytes);
+
+                if (log.isDebugEnabled())
+                    log.debug("Updating undoable block with hash: " + Utils.HEX.encode(hashBytes));
+
                 if (transactions == null) {
                     s.setBytes(1, txOutChanges);
                     s.setNull(2, Types.BINARY);
@@ -718,10 +704,37 @@ public abstract class DatabaseFullPrunedBlockStore implements FullPrunedBlockSto
                 }
                 s.executeUpdate();
                 s.close();
+
+                return;
             }
-        } catch (SQLException ex) {
-            throw new BlockStoreException(ex);
+            findS.close();
+
+            PreparedStatement s =
+                    conn.get().prepareStatement(getInsertUndoableBlocksSQL());
+            s.setBytes(1, hashBytes);
+            s.setInt(2, height);
+
+            if (log.isDebugEnabled())
+                log.debug("Inserting undoable block with hash: " + Utils.HEX.encode(hashBytes)  + " at height " + height);
+
+            if (transactions == null) {
+                s.setBytes(3, txOutChanges);
+                s.setNull(4, Types.BINARY);
+            } else {
+                s.setNull(3, Types.BINARY);
+                s.setBytes(4, transactions);
+            }
+            s.executeUpdate();
+            s.close();
+            try {
+                putUpdateStoredBlock(storedBlock, true);
+            } catch (SQLException e) {
+                throw new BlockStoreException(e);
+            }
+        } catch (SQLException e) {
+            throw new BlockStoreException(e);
         }
+
     }
 
     public StoredBlock get(Sha256Hash hash, boolean wasUndoableOnly) throws BlockStoreException {
@@ -957,10 +970,23 @@ public abstract class DatabaseFullPrunedBlockStore implements FullPrunedBlockSto
         maybeConnect();
         PreparedStatement s = null;
         try {
+            PreparedStatement findS = conn.get().prepareStatement(SELECT_OPENOUTPUTS_EXISTS_SQL);
+            byte[] hashBytes = out.getHash().getBytes();
+            findS.setBytes(1, hashBytes);
+            int index = (int) out.getIndex();
+            findS.setInt(2, index);
+
+            ResultSet rs = findS.executeQuery();
+            if (rs.next()) {
+                findS.close();
+                return;
+            }
+            findS.close();
+
             s = conn.get().prepareStatement(getInsertOpenoutputsSQL());
-            s.setBytes(1, out.getHash().getBytes());
+            s.setBytes(1, hashBytes);
             // index is actually an unsigned int
-            s.setInt(2, (int) out.getIndex());
+            s.setInt(2, index);
             s.setInt(3, out.getHeight());
             s.setLong(4, out.getValue().value);
             s.setBytes(5, out.getScript().getProgram());
@@ -970,8 +996,7 @@ public abstract class DatabaseFullPrunedBlockStore implements FullPrunedBlockSto
             s.executeUpdate();
             s.close();
         } catch (SQLException e) {
-            if (!(e.getSQLState().equals(getDuplicateKeyErrorCode())))
-                throw new BlockStoreException(e);
+            throw new BlockStoreException(e);
         } finally {
             if (s != null) {
                 try {
